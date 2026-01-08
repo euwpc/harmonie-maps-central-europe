@@ -8,14 +8,18 @@ from matplotlib.colors import ListedColormap, BoundaryNorm, Normalize
 import matplotlib
 import datetime
 import os
-import imageio.v2 as imageio  # Fixed deprecation warning
+import imageio.v2 as imageio
 import pandas as pd
 import warnings
+import time
 
 matplotlib.use('Agg')
 
-# Suppress cartopy download warnings (they're harmless on GitHub runners)
+# Suppress cartopy download warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="cartopy")
+
+# KNMI Data Platform API key
+API_KEY = "13aaa27fe3d346ebd5c246ff6a2d82c0"
 
 # --- Helper to parse QML color ramp ---
 def parse_qml_colormap(qml_file, vmin, vmax):
@@ -43,42 +47,64 @@ def parse_qml_colormap(qml_file, vmin, vmax):
 
     return cmap, norm
 
-# --- Step 1: Latest model run ---
-wfs_url = "https://opendata.fmi.fi/wfs?service=WFS&version=2.0.0&request=getFeature&storedquery_id=fmi::forecast::harmonie::surface::grid"
-response = requests.get(wfs_url, timeout=60)
+# --- Step 1: Get latest HARMONIE run from KNMI ---
+base_url = "https://api.dataplatform.knmi.nl/open-data/v1"
+headers = {"Authorization": API_KEY}
+
+dataset_name = "harmonie-arome-cy43-p3"
+dataset_version = "1.0"
+
+list_files_url = f"{base_url}/datasets/{dataset_name}/versions/{dataset_version}/files"
+
+params = {"maxKeys": 1000, "orderBy": "created", "sorting": "desc"}
+response = requests.get(list_files_url, headers=headers, params=params)
 response.raise_for_status()
-tree = ET.fromstring(response.content)
+files = response.json()["files"]
 
-ns = {'gml': 'http://www.opengis.net/gml/3.2', 'omso': 'http://inspire.ec.europa.eu/schemas/omso/3.0'}
-origintimes = [elem.text for elem in tree.findall('.//omso:phenomenonTime//gml:beginPosition', ns)] or \
-              [elem.text for elem in tree.findall('.//gml:beginPosition', ns)]
-latest_origintime = max(origintimes)
-run_time_str = datetime.datetime.strptime(latest_origintime, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M UTC")
+# Sort by filename descending to get latest run
+files = sorted(files, key=lambda f: f["filename"], reverse=True)
 
-# --- Step 2: Download with Precipitation1h ---
-download_url = (
-    "https://opendata.fmi.fi/download?"
-    "producer=harmonie_scandinavia_surface&"
-    "param=temperature,Dewpoint,Pressure,CAPE,WindGust,Precipitation1h&"
-    "format=netcdf&"
-    "bbox=10,53,35,71&"
-    "projection=EPSG:4326"
-)
-response = requests.get(download_url, timeout=300)
-response.raise_for_status()
-nc_path = "harmonie.nc"
-with open(nc_path, "wb") as f:
-    f.write(response.content)
+latest_run_prefix = None
+for f in files:
+    name = f["filename"]
+    if "_00000_GB" in name and name.startswith("HA43_P3_"):
+        latest_run_prefix = name.split("_00000_GB")[0]
+        break
 
-# --- Step 3: Load data ---
-ds = xr.open_dataset(nc_path)
+if not latest_run_prefix:
+    raise ValueError("No recent HARMONIE files found")
 
-temp_c = ds['air_temperature_4'] - 273.15
-dewpoint_c = ds['dew_point_temperature_10'] - 273.15
-pressure_hpa = ds['air_pressure_at_sea_level_1'] / 100
-cape = ds['atmosphere_specific_convective_available_potential_energy_59']
-windgust_ms = ds['wind_speed_of_gust_417']
-precip1h_mm = ds['precipitation_amount_353'] * 3600
+run_time_str = datetime.datetime.strptime(latest_run_prefix[-12:], "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M UTC")
+
+# --- Step 2: Download all GRIB files for the latest run ---
+grib_paths = []
+for f in files:
+    filename = f["filename"]
+    if filename.startswith(latest_run_prefix):
+        url = f"{base_url}/datasets/{dataset_name}/versions/{dataset_version}/files/{filename}/url"
+        get_url_response = requests.get(url, headers=headers)
+        get_url_response.raise_for_status()
+        download_url = get_url_response.json()["temporaryDownloadUrl"]
+
+        local_path = filename
+        print(f"Downloading {filename}...")
+        with requests.get(download_url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, 'wb') as lf:
+                for chunk in r.iter_content(chunk_size=8192):
+                    lf.write(chunk)
+        grib_paths.append(local_path)
+
+# --- Step 3: Open with cfgrib ---
+ds = xr.open_mfdataset(grib_paths, combine='by_coords', engine='cfgrib')
+
+# Variables (standard GRIB shortNames in KNMI Cy43)
+temp_c = ds['t2m'] - 273.15
+dewpoint_c = ds['d2m'] - 273.15
+pressure_hpa = ds['msl'] / 100
+cape = ds['cape']
+windgust_ms = ds['gust']
+precip1h_mm = ds['tp']  # 1h accumulation in mm
 
 # --- Step 4: Load custom colormaps ---
 temp_cmap, temp_norm = parse_qml_colormap("temperature_color_table_high.qml", vmin=-40, vmax=50)
@@ -92,22 +118,20 @@ dewpoint_norm = Normalize(vmin=-40, vmax=50)
 
 # --- Step 5: Helper ---
 def get_analysis(var):
-    if 'time' in var.dims:
-        return var.isel(time=0)
-    elif 'time_h' in var.dims:
-        return var.isel(time_h=0)
+    if 'step' in var.dims:
+        return var.isel(step=0)
     return var
 
-# --- Step 6: Wide Central/Northern Europe view (to match meteologix size) ---
+# --- Step 6: Central Europe view (full KNMI coverage) ---
 views = {
-    'central_europe_wide': {'extent': [-10, 35, 48, 70], 'suffix': ''}  # UK to Russia, Denmark to northern France/Poland
+    'central_europe': {'extent': [-5, 20, 47, 60], 'suffix': ''}
 }
 
 variables = {
     'temperature': {'var': temp_c, 'cmap': temp_cmap, 'norm': temp_norm, 'unit': '°C', 'title': '2m Temperature (°C)',
                     'levels': [-40, -38, -36, -34, -32, -30, -28, -26, -24, -22, -20, -18, -16, -14, -12, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50]},
     'dewpoint':    {'var': dewpoint_c, 'cmap': dewpoint_cmap, 'norm': dewpoint_norm, 'unit': '°C', 'title': '2m Dew Point (°C)',
-                    'levels': [-40, -38, -36, -34, -32, -30, -28, -26, -24, -22, -20, -18, -16, -14, -12, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50]},
+                    'levels': [-40, -35, -30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]},
     'pressure':    {'var': pressure_hpa, 'cmap': pressure_cmap, 'norm': pressure_norm, 'unit': 'hPa', 'title': 'MSLP (hPa)',
                     'levels': [890, 900, 910, 915, 920, 925, 929, 933, 938, 942, 946, 950, 954, 958, 962, 965, 968, 972, 974, 976, 978, 980, 982, 984, 986, 988, 990, 992, 994, 996, 998, 1000, 1002, 1004, 1006, 1008, 1010, 1012, 1014, 1016, 1018, 1020, 1022, 1024, 1026, 1028, 1030, 1032, 1034, 1036, 1038, 1040, 1042, 1044, 1046, 1048, 1050, 1052, 1054, 1056, 1058, 1060, 1062, 1064]},
     'cape':        {'var': cape, 'cmap': cape_cmap, 'norm': cape_norm, 'unit': 'J/kg', 'title': 'CAPE (J/kg)',
@@ -115,10 +139,10 @@ variables = {
     'windgust':    {'var': windgust_ms, 'cmap': windgust_cmap, 'norm': windgust_norm, 'unit': 'm/s', 'title': 'Wind Gust (m/s)',
                     'levels': [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]},
     'precipitation': {'var': precip1h_mm, 'cmap': precip_cmap, 'norm': precip_norm, 'unit': 'mm', 'title': '1h Precipitation (mm)',
-                      'levels': [0, 0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 30, 40, 50, 60, 80, 100, 125]},
+                      'levels': [0, 0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 30]},
 }
 
-# --- Generate wide Central/Northern Europe maps ---
+# --- Generate Central Europe maps ---
 for view_key, view_conf in views.items():
     extent = view_conf['extent']
     suffix = view_conf['suffix']
@@ -127,32 +151,22 @@ for view_key, view_conf in views.items():
     for var_key, conf in variables.items():
         data = get_analysis(conf['var'])
 
-        # Min/max only in view region
+        # Min/max in view
         try:
-            cropped_data = data.sel(lon=slice(lon_min, lon_max), lat=slice(lat_min, lat_max))
-            if cropped_data.size == 0:
-                raise ValueError
+            cropped_data = data.sel(longitude=slice(lon_min, lon_max), latitude=slice(lat_max, lat_min))  # latitude descending
             min_val = float(cropped_data.min(skipna=True))
             max_val = float(cropped_data.max(skipna=True))
         except:
             min_val = float(data.min(skipna=True))
             max_val = float(data.max(skipna=True))
 
-        fig = plt.figure(figsize=(12, 9))  # Slightly larger figure for wide view
+        fig = plt.figure(figsize=(12, 10))
         ax = plt.axes(projection=ccrs.PlateCarree())
-        data.plot.contourf(
-            ax=ax,
-            transform=ccrs.PlateCarree(),
-            cmap=conf['cmap'],
-            norm=conf['norm'],
-            levels=100,
-            cbar_kwargs={'label': conf['unit'], 'shrink': 0.8, 'pad': 0.05}
-        )
+        data.plot.contourf(ax=ax, transform=ccrs.PlateCarree(), cmap=conf['cmap'], norm=conf['norm'], levels=100,
+                           cbar_kwargs={'label': conf['unit'], 'shrink': 0.8, 'pad': 0.05})
 
-        # Only MSLP gets contours and labels
         if var_key == 'pressure':
-            cl = data.plot.contour(ax=ax, transform=ccrs.PlateCarree(),
-                                   colors='black', linewidths=0.8, levels=conf['levels'])
+            cl = data.plot.contour(ax=ax, transform=ccrs.PlateCarree(), colors='black', linewidths=0.8, levels=conf['levels'])
             ax.clabel(cl, inline=True, fontsize=9, fmt="%d", inline_spacing=8, use_clabeltext=True)
 
         ax.coastlines(resolution='10m', linewidth=1.2)
@@ -168,10 +182,9 @@ for view_key, view_conf in views.items():
         plt.savefig(f"{var_key}{suffix}.png", dpi=170, bbox_inches='tight', facecolor='#f8f9fa')
         plt.close()
 
-        # Animation frames — 112 DPI, 1152×880 pixels
+        # Animation frames
         frame_paths = []
-        time_dim = 'time' if 'time' in conf['var'].dims else 'time_h'
-        time_values = ds[time_dim].values
+        time_values = ds['step'].values if 'step' in ds.coords else ds['time'].values
 
         fig_width = 1152 / 112
         fig_height = 880 / 112
@@ -182,27 +195,19 @@ for view_key, view_conf in views.items():
 
             fig = plt.figure(figsize=(fig_width, fig_height), dpi=112)
             ax = plt.axes(projection=ccrs.PlateCarree())
-            slice_data = conf['var'].isel(**{time_dim: i})
+            slice_data = conf['var'].isel(step=i) if 'step' in conf['var'].dims else conf['var'].isel(time=i)
 
             try:
-                slice_cropped = slice_data.sel(lon=slice(lon_min, lon_max), lat=slice(lat_min, lat_max))
-                slice_min = float(slice_cropped.min(skipna=True))
-                slice_max = float(slice_cropped.max(skipna=True))
+                slice_min = float(slice_data.sel(longitude=slice(lon_min, lon_max), latitude=slice(lat_max, lat_min)).min(skipna=True))
+                slice_max = float(slice_data.sel(longitude=slice(lon_min, lon_max), latitude=slice(lat_max, lat_min)).max(skipna=True))
             except:
                 slice_min = float(slice_data.min(skipna=True))
                 slice_max = float(slice_data.max(skipna=True))
 
-            slice_data.plot.contourf(
-                ax=ax,
-                transform=ccrs.PlateCarree(),
-                cmap=conf['cmap'],
-                norm=conf['norm'],
-                levels=100
-            )
+            slice_data.plot.contourf(ax=ax, transform=ccrs.PlateCarree(), cmap=conf['cmap'], norm=conf['norm'], levels=100)
 
             if var_key == 'pressure':
-                cl = slice_data.plot.contour(ax=ax, transform=ccrs.PlateCarree(),
-                                             colors='black', linewidths=0.8, levels=conf['levels'])
+                cl = slice_data.plot.contour(ax=ax, transform=ccrs.PlateCarree(), colors='black', linewidths=0.8, levels=conf['levels'])
                 ax.clabel(cl, inline=True, fontsize=9, fmt="%d", inline_spacing=8, use_clabeltext=True)
 
             ax.coastlines(resolution='10m', linewidth=1.2)
@@ -210,7 +215,7 @@ for view_key, view_conf in views.items():
             ax.gridlines(draw_labels=True, linewidth=0.8, color='gray', alpha=0.5)
             ax.set_extent(extent)
 
-            valid_dt = pd.to_datetime(time_values[i]) + pd.Timedelta(hours=2)
+            valid_dt = pd.to_datetime(ds['time' if 'time' in ds.coords else 'valid_time'][i].values)
             valid_str = valid_dt.strftime("%a %d %b %H:%M EET")
 
             plt.title(
@@ -234,7 +239,8 @@ for view_key, view_conf in views.items():
         for fp in frame_paths:
             os.remove(fp)
 
-if os.path.exists("harmonie.nc"):
-    os.remove("harmonie.nc")
+# Cleanup GRIB files
+for p in grib_paths:
+    os.remove(p)
 
-print("Wide Central/Northern Europe maps + MP4 animations generated")
+print("Central Europe (KNMI HARMONIE) maps + MP4 animations generated")
