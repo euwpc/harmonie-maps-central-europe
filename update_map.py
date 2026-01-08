@@ -98,9 +98,9 @@ def get_analysis(var):
         return var.isel(time_h=0)
     return var
 
-# --- Step 6: Central Europe view (changed only this line) ---
+# --- Step 6: Wide Central/Northern Europe view (to match meteologix size) ---
 views = {
-    'central_europe': {'extent': [2, 25, 48, 59], 'suffix': ''}
+    'central_europe_wide': {'extent': [-10, 35, 48, 70], 'suffix': ''}  # UK to Russia, Denmark to northern France/Poland
 }
 
 variables = {
@@ -118,7 +118,7 @@ variables = {
                       'levels': [0, 0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 30, 40, 50, 60, 80, 100, 125]},
 }
 
-# --- Generate Central Europe maps only ---
+# --- Generate wide Central/Northern Europe maps ---
 for view_key, view_conf in views.items():
     extent = view_conf['extent']
     suffix = view_conf['suffix']
@@ -138,7 +138,7 @@ for view_key, view_conf in views.items():
             min_val = float(data.min(skipna=True))
             max_val = float(data.max(skipna=True))
 
-        fig = plt.figure(figsize=(10, 8))
+        fig = plt.figure(figsize=(12, 9))  # Slightly larger figure for wide view
         ax = plt.axes(projection=ccrs.PlateCarree())
         data.plot.contourf(
             ax=ax,
@@ -168,14 +168,13 @@ for view_key, view_conf in views.items():
         plt.savefig(f"{var_key}{suffix}.png", dpi=170, bbox_inches='tight', facecolor='#f8f9fa')
         plt.close()
 
-        # Animation frames — 120 DPI, fixed size divisible by 16
+        # Animation frames — 112 DPI, 1152×880 pixels
         frame_paths = []
         time_dim = 'time' if 'time' in conf['var'].dims else 'time_h'
         time_values = ds[time_dim].values
 
-        # Size that gives exactly 1232×928 pixels at 120 DPI (divisible by 16)
-        fig_width = 1152 / 112   # 1232 / 120
-        fig_height = 880 / 112   # 928 / 120
+        fig_width = 1152 / 112
+        fig_height = 880 / 112
 
         for i in range(len(time_values)):
             if i >= 48 and (i - 48) % 3 != 0:
@@ -185,11 +184,8 @@ for view_key, view_conf in views.items():
             ax = plt.axes(projection=ccrs.PlateCarree())
             slice_data = conf['var'].isel(**{time_dim: i})
 
-            # Min/max only in view region
             try:
                 slice_cropped = slice_data.sel(lon=slice(lon_min, lon_max), lat=slice(lat_min, lat_max))
-                if slice_cropped.size == 0:
-                    raise ValueError
                 slice_min = float(slice_cropped.min(skipna=True))
                 slice_max = float(slice_cropped.max(skipna=True))
             except:
@@ -204,7 +200,6 @@ for view_key, view_conf in views.items():
                 levels=100
             )
 
-            # Only pressure gets smooth isobars
             if var_key == 'pressure':
                 cl = slice_data.plot.contour(ax=ax, transform=ccrs.PlateCarree(),
                                              colors='black', linewidths=0.8, levels=conf['levels'])
@@ -242,4 +237,4 @@ for view_key, view_conf in views.items():
 if os.path.exists("harmonie.nc"):
     os.remove("harmonie.nc")
 
-print("Central Europe maps + MP4 animations generated")
+print("Wide Central/Northern Europe maps + MP4 animations generated")
