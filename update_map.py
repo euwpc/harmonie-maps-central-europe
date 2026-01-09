@@ -98,9 +98,9 @@ def get_analysis(var):
         return var.isel(time_h=0)
     return var
 
-# --- Step 6: Central Europe view (changed only this line) ---
+# --- Step 6: Baltic Region view ---
 views = {
-    'central_europe': {'extent': [10, 35, 53, 71], 'suffix': ''}
+    'baltic': {'extent': [-0.2, 33.5, 51.5, 71], 'suffix': ''}
 }
 
 variables = {
@@ -118,7 +118,7 @@ variables = {
                       'levels': [0, 0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 30, 40, 50, 60, 80, 100, 125]},
 }
 
-# --- Generate Central Europe maps only ---
+# --- Generate Baltic region only ---
 for view_key, view_conf in views.items():
     extent = view_conf['extent']
     suffix = view_conf['suffix']
@@ -127,7 +127,7 @@ for view_key, view_conf in views.items():
     for var_key, conf in variables.items():
         data = get_analysis(conf['var'])
 
-        # Min/max only in view region
+        # Min/max only in Baltic region
         try:
             cropped_data = data.sel(lon=slice(lon_min, lon_max), lat=slice(lat_min, lat_max))
             if cropped_data.size == 0:
@@ -185,7 +185,7 @@ for view_key, view_conf in views.items():
             ax = plt.axes(projection=ccrs.PlateCarree())
             slice_data = conf['var'].isel(**{time_dim: i})
 
-            # Min/max only in view region
+            # Min/max only in Baltic region
             try:
                 slice_cropped = slice_data.sel(lon=slice(lon_min, lon_max), lat=slice(lat_min, lat_max))
                 if slice_cropped.size == 0:
@@ -242,4 +242,4 @@ for view_key, view_conf in views.items():
 if os.path.exists("harmonie.nc"):
     os.remove("harmonie.nc")
 
-print("Central Europe maps + MP4 animations generated")
+print("Baltic region maps + MP4 animations generated")
