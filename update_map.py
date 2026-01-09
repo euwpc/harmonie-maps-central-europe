@@ -8,13 +8,13 @@ from matplotlib.colors import ListedColormap, BoundaryNorm, Normalize
 import matplotlib
 import datetime
 import os
-import imageio.v2 as imageio
+import imageio.v2 as imageio  # Fixed deprecation warning
 import pandas as pd
 import warnings
 
 matplotlib.use('Agg')
 
-# Suppress cartopy download warnings
+# Suppress cartopy download warnings (they're harmless on GitHub runners)
 warnings.filterwarnings("ignore", category=UserWarning, module="cartopy")
 
 # --- Helper to parse QML color ramp ---
@@ -55,13 +55,13 @@ origintimes = [elem.text for elem in tree.findall('.//omso:phenomenonTime//gml:b
 latest_origintime = max(origintimes)
 run_time_str = datetime.datetime.strptime(latest_origintime, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M UTC")
 
-# --- Step 2: Download with Precipitation1h (wide bbox to cover full model domain) ---
+# --- Step 2: Download with Precipitation1h ---
 download_url = (
     "https://opendata.fmi.fi/download?"
     "producer=harmonie_scandinavia_surface&"
     "param=temperature,Dewpoint,Pressure,CAPE,WindGust,Precipitation1h&"
     "format=netcdf&"
-    "bbox=-15,48,40,71&"  # Full available FMI HARMONIE domain
+    "bbox=10,53,35,71&"
     "projection=EPSG:4326"
 )
 response = requests.get(download_url, timeout=300)
@@ -98,9 +98,9 @@ def get_analysis(var):
         return var.isel(time_h=0)
     return var
 
-# --- Step 6: Wide view exactly like your screenshot (full FMI domain) ---
+# --- Step 6: Central Europe view (changed only this line) ---
 views = {
-    'wide_europe': {'extent': [10, 35, 53, 71], 'suffix': ''}
+    'central_europe': {'extent': [10, 35, 53, 71], 'suffix': ''}
 }
 
 variables = {
@@ -118,7 +118,7 @@ variables = {
                       'levels': [0, 0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 30, 40, 50, 60, 80, 100, 125]},
 }
 
-# --- Generate wide view maps ---
+# --- Generate Central Europe maps only ---
 for view_key, view_conf in views.items():
     extent = view_conf['extent']
     suffix = view_conf['suffix']
@@ -138,7 +138,7 @@ for view_key, view_conf in views.items():
             min_val = float(data.min(skipna=True))
             max_val = float(data.max(skipna=True))
 
-        fig = plt.figure(figsize=(14, 10))  # Larger figure for wide view
+        fig = plt.figure(figsize=(10, 8))
         ax = plt.axes(projection=ccrs.PlateCarree())
         data.plot.contourf(
             ax=ax,
@@ -168,13 +168,14 @@ for view_key, view_conf in views.items():
         plt.savefig(f"{var_key}{suffix}.png", dpi=170, bbox_inches='tight', facecolor='#f8f9fa')
         plt.close()
 
-        # Animation frames — 112 DPI, fixed size divisible by 16
+        # Animation frames — 120 DPI, fixed size divisible by 16
         frame_paths = []
         time_dim = 'time' if 'time' in conf['var'].dims else 'time_h'
         time_values = ds[time_dim].values
 
-        fig_width = 1152 / 112
-        fig_height = 880 / 112
+        # Size that gives exactly 1232×928 pixels at 120 DPI (divisible by 16)
+        fig_width = 1152 / 112   # 1232 / 120
+        fig_height = 880 / 112   # 928 / 120
 
         for i in range(len(time_values)):
             if i >= 48 and (i - 48) % 3 != 0:
@@ -184,8 +185,11 @@ for view_key, view_conf in views.items():
             ax = plt.axes(projection=ccrs.PlateCarree())
             slice_data = conf['var'].isel(**{time_dim: i})
 
+            # Min/max only in view region
             try:
                 slice_cropped = slice_data.sel(lon=slice(lon_min, lon_max), lat=slice(lat_min, lat_max))
+                if slice_cropped.size == 0:
+                    raise ValueError
                 slice_min = float(slice_cropped.min(skipna=True))
                 slice_max = float(slice_cropped.max(skipna=True))
             except:
@@ -200,6 +204,7 @@ for view_key, view_conf in views.items():
                 levels=100
             )
 
+            # Only pressure gets smooth isobars
             if var_key == 'pressure':
                 cl = slice_data.plot.contour(ax=ax, transform=ccrs.PlateCarree(),
                                              colors='black', linewidths=0.8, levels=conf['levels'])
@@ -237,4 +242,4 @@ for view_key, view_conf in views.items():
 if os.path.exists("harmonie.nc"):
     os.remove("harmonie.nc")
 
-print("Wide Europe maps + MP4 animations generated")
+print("Central Europe maps + MP4 animations generated")
